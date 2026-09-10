@@ -3,20 +3,16 @@
 
 const BASE = 'https://collectionapi.metmuseum.org/public/collection/v1'
 
-// The API has no endpoint that returns "random object with an image", so the
-// strategy is: fetch a pool of object IDs once (all of which are known to have
-// images), cache it, then randomly sample from that pool and fetch details.
-export const POOLS = {
-  highlights: {
-    label: 'Highlights',
-    hint: 'Curator-picked masterworks',
-    url: `${BASE}/search?isHighlight=true&hasImages=true&q=*`,
-  },
-  all: {
-    label: 'Full collection',
-    hint: 'Deep cuts — anything with an image',
-    url: `${BASE}/search?hasImages=true&q=*`,
-  },
+// Categories of "hanging art". Each is an object-ID pool built from a search.
+// NOTE: the Met search treats `q=*` inconsistently, so each pool uses a real
+// query term alongside the `medium` filter for stable results. Public-domain
+// (CC0, free for commercial use) filtering is done client-side on each object,
+// because the API's `isPublicDomain` search param does not actually filter.
+export const CATEGORIES = {
+  paintings: { label: 'Paintings', medium: 'Paintings', q: 'painting' },
+  drawings: { label: 'Drawings', medium: 'Drawings', q: 'drawing' },
+  prints: { label: 'Prints', medium: 'Prints', q: 'print' },
+  photographs: { label: 'Photographs', medium: 'Photographs', q: 'photograph' },
 }
 
 const CACHE_PREFIX = 'met-pool-'
@@ -42,41 +38,48 @@ function writeCache(key, ids) {
   }
 }
 
-// Returns the array of object IDs for a given pool, cached across sessions.
-export async function getPoolIds(poolKey) {
-  const pool = POOLS[poolKey]
-  if (!pool) throw new Error(`Unknown pool: ${poolKey}`)
+// Returns the array of object IDs for a category, cached across sessions.
+export async function getPoolIds(categoryKey) {
+  const cat = CATEGORIES[categoryKey]
+  if (!cat) throw new Error(`Unknown category: ${categoryKey}`)
 
-  const cached = readCache(poolKey)
+  const cached = readCache(categoryKey)
   if (cached) return cached
 
-  const res = await fetch(pool.url)
-  if (!res.ok) throw new Error(`Failed to load ${pool.label} (HTTP ${res.status})`)
+  const url = `${BASE}/search?hasImages=true&medium=${encodeURIComponent(
+    cat.medium,
+  )}&q=${encodeURIComponent(cat.q)}`
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`Failed to load ${cat.label} (HTTP ${res.status})`)
   const data = await res.json()
   const ids = data.objectIDs || []
-  writeCache(poolKey, ids)
+  writeCache(categoryKey, ids)
   return ids
 }
 
-// Fetch details for a single object. Returns null on failure or if it turns
-// out to have no usable image, so callers can filter these out.
+// Fetch one object. Returns null on failure, if it lacks an image, or if it is
+// NOT public domain (we only surface CC0 works that are free to reuse).
 export async function getObject(id) {
   try {
     const res = await fetch(`${BASE}/objects/${id}`)
     if (!res.ok) return null
     const o = await res.json()
     const image = o.primaryImageSmall || o.primaryImage
-    if (!image) return null
+    if (!image || !o.isPublicDomain) return null
     return {
       id: o.objectID,
       title: o.title || 'Untitled',
       artist: o.artistDisplayName || '',
+      artistNationality: o.artistNationality || '',
       date: o.objectDate || '',
+      beginDate: o.objectBeginDate,
+      endDate: o.objectEndDate,
       medium: o.medium || '',
+      classification: o.classification || '',
       department: o.department || '',
       culture: o.culture || '',
       creditLine: o.creditLine || '',
-      isHighlight: o.isHighlight || false,
+      tags: (o.tags || []).map((t) => t.term).filter(Boolean),
       image,
       imageLarge: o.primaryImage || image,
       url: o.objectURL || '',
@@ -86,7 +89,6 @@ export async function getObject(id) {
   }
 }
 
-// Pick `count` distinct random elements from an array.
 function sample(arr, count) {
   const picks = new Set()
   const max = Math.min(count, arr.length)
@@ -96,8 +98,7 @@ function sample(arr, count) {
   return [...picks]
 }
 
-// Run async tasks with bounded concurrency (keeps us well under the API's
-// rate limit and avoids hammering it with hundreds of parallel requests).
+// Run async tasks with bounded concurrency (stays well under the API rate limit).
 async function mapLimit(items, limit, fn) {
   const results = []
   let i = 0
@@ -111,24 +112,27 @@ async function mapLimit(items, limit, fn) {
   return results
 }
 
-// Fetch `count` random objects (with images) from the given pool.
-// Over-samples to compensate for objects that fail or lack images.
-export async function getRandomObjects(poolKey, count, { signal } = {}) {
-  const ids = await getPoolIds(poolKey)
-  if (ids.length === 0) return []
+// Fetch `count` random, public-domain artworks from a category, skipping any IDs
+// in `exclude`. Over-samples to compensate for non-CC0 / imageless objects.
+export async function getSwipeCandidates(categoryKey, count, { exclude } = {}) {
+  const ids = await getPoolIds(categoryKey)
+  const seen = exclude instanceof Set ? exclude : new Set()
+  const pool = ids.filter((id) => !seen.has(id))
+  if (pool.length === 0) return []
 
   const collected = []
   const tried = new Set()
   let attempts = 0
-  const maxAttempts = 4 // batches of over-sampled fetches
+  const maxAttempts = 5
 
   while (collected.length < count && attempts < maxAttempts) {
-    if (signal?.aborted) break
     const need = count - collected.length
+    // ~55% of image-bearing works are public domain, so over-sample generously.
     const batchIds = sample(
-      ids.filter((id) => !tried.has(id)),
-      Math.ceil(need * 1.6) + 2,
+      pool.filter((id) => !tried.has(id)),
+      Math.ceil(need * 2.2) + 3,
     )
+    if (batchIds.length === 0) break
     batchIds.forEach((id) => tried.add(id))
 
     const objects = await mapLimit(batchIds, 6, getObject)
